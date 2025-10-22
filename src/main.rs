@@ -1,285 +1,273 @@
-mod args;
-mod command;
-mod error;
-mod send;
-mod utils;
+use std::{fs, path::PathBuf, str::FromStr, sync::atomic::{AtomicU64, Ordering}, time::{Duration, Instant}};
 
-use futures::StreamExt;
-use std::{sync::Arc, sync::RwLock};
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::protocol::Message;
-
-use args::*;
-use clap::{command, Parser, Subcommand};
-use solana_client::nonblocking::rpc_client::RpcClient;
+use anyhow::{anyhow, Result};
+use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
+use rand::Rng;
+use rayon::prelude::*;
+use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
-    signature::{read_keypair_file, Keypair},
+    instruction::{AccountMeta, Instruction},
+    message::Message,
+    pubkey::Pubkey,
+    signature::{Keypair, Signature, Signer, read_keypair_file},
+    system_program,
+    transaction::Transaction,
 };
-use utils::{PoolMiningData, SoloMiningData, Tip};
+use zenore::{pow_hash, leading_zero_bits};
 
-// TODO: Unify balance and proof into "account"
-// TODO: Move balance subcommands to "pool"
-// TODO: Make checkpoint an admin command
-// TODO: Remove boost command
+#[derive(Parser, Debug)]
+#[command(name="zenore", version, about="zenORE – testnet PoW miner & tools")]
+struct Cli {
+    /// RPC url (testnet by default)
+    #[arg(long, default_value="https://api.testnet.solana.com")]
+    rpc: String,
 
-#[derive(Clone)]
-struct Miner {
-    pub keypair_filepath: Option<String>,
-    pub priority_fee: Option<u64>,
-    pub dynamic_fee_url: Option<String>,
-    pub dynamic_fee: bool,
-    pub rpc_client: Arc<RpcClient>,
-    pub fee_payer_filepath: Option<String>,
-    pub jito_client: Arc<RpcClient>,
-    pub tip: Arc<std::sync::RwLock<u64>>,
-    pub solo_mining_data: Arc<std::sync::RwLock<Vec<SoloMiningData>>>,
-    pub pool_mining_data: Arc<std::sync::RwLock<Vec<PoolMiningData>>>,
+    /// Program ID for the Anchor program
+    #[arg(long, default_value="TeStoRe111111111111111111111111111111111111")]
+    program: String,
+
+    /// Path to keypair file
+    #[arg(long, default_value="~/.config/solana/id.json")]
+    keypair: String,
+
+    /// Optional path to a newline-delimited list of keypair files (team mining)
+    #[arg(long)]
+    keypair_list: Option<PathBuf>,
+
+    /// Number of threads to use (0 = all cores)
+    #[arg(long, default_value_t=0)]
+    threads: usize,
+
+    /// Show metrics while mining
+    #[arg(long, default_value_t=true)]
+    metrics: bool,
+
+    #[command(subcommand)]
+    cmd: Command,
 }
 
 #[derive(Subcommand, Debug)]
-enum Commands {
-    #[command(about = "Fetch your account details")]
-    Account(AccountArgs),
+enum Command {
+    /// Start mining on testnet
+    Mine {
+        /// Difficulty in leading zero bits (default: 20 for testnet)
+        #[arg(long, default_value_t=20)]
+        difficulty: u32,
+        /// Optional static seed as base58 (otherwise derived from program id)
+        #[arg(long)]
+        seed_b58: Option<String>,
+    },
 
-    #[command(about = "Benchmark your machine's hashpower")]
-    Benchmark(BenchmarkArgs),
-
-    #[command(about = "Claim your mining yield")]
-    Claim(ClaimArgs),
-
-    #[cfg(feature = "admin")]
-    #[command(about = "Initialize the program")]
-    Initialize(InitializeArgs),
-
-    #[command(about = "Start mining on your local machine")]
-    Mine(MineArgs),
-
-    #[command(about = "Connect to a mining pool")]
-    Pool(PoolArgs),
-
-    #[command(about = "Fetch onchain global program variables")]
-    Program(ProgramArgs),
-
-    #[command(about = "Manage your stake positions")]
-    Stake(StakeArgs),
-
-    #[command(about = "Fetch details about an ORE transaction")]
-    Transaction(TransactionArgs),
-
-    #[command(about = "Send ORE to another user")]
-    Transfer(TransferArgs),
+    /// Submit a single proof (nonce) for debugging
+    Submit {
+        #[arg(long)]
+        nonce: u64,
+        #[arg(long, default_value_t=20)]
+        difficulty: u32,
+        #[arg(long)]
+        seed_b58: Option<String>,
+    },
 }
 
-#[derive(Parser, Debug)]
-#[command(about, version)]
-struct Args {
-    #[arg(
-        long,
-        value_name = "NETWORK_URL",
-        help = "Network address of your RPC provider",
-        global = true
-    )]
-    rpc: Option<String>,
+fn expand_tilde(path: &str) -> String {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(stripped).to_string_lossy().to_string();
+        }
+    }
+    path.to_string()
+}
 
-    #[clap(
-        global = true,
-        short = 'C',
-        long = "config",
-        id = "PATH",
-        help = "Filepath to config file."
-    )]
-    config_file: Option<String>,
+fn read_keypairs(cli: &Cli) -> Result<Vec<Keypair>> {
+    if let Some(list_path) = &cli.keypair_list {
+        let txt = fs::read_to_string(list_path)?;
+        let mut v = vec![];
+        for line in txt.lines() {
+            let p = expand_tilde(line.trim());
+            if p.is_empty() { continue; }
+            v.push(read_keypair_file(p).map_err(|e| anyhow!("Failed reading {}: {}", line, e))?);
+        }
+        Ok(v)
+    } else {
+        let p = expand_tilde(&cli.keypair);
+        Ok(vec![read_keypair_file(p)?])
+    }
+}
 
-    #[arg(
-        long,
-        value_name = "KEYPAIR_FILEPATH",
-        help = "Filepath to signer keypair.",
-        global = true
-    )]
-    keypair: Option<String>,
+fn program_pubkey(cli: &Cli) -> Result<Pubkey> {
+    Ok(Pubkey::from_str(&cli.program)?)
+}
 
-    #[arg(
-        long,
-        value_name = "FEE_PAYER_FILEPATH",
-        help = "Filepath to transaction fee payer keypair.",
-        global = true
-    )]
-    fee_payer: Option<String>,
+fn seed_from(cli: &Cli) -> [u8; 32] {
+    if let Some(b58) = &cli.seed_b58() {
+        let mut out = [0u8; 32];
+        let decoded = bs58::decode(b58).into_vec().unwrap_or_default();
+        for (i, b) in decoded.iter().take(32).enumerate() { out[i] = *b; }
+        return out;
+    }
+    // Default: derive from program id for testnet reproducibility
+    let mut out = [0u8; 32];
+    let pid = bs58::decode(&cli.program).into_vec().unwrap_or_default();
+    for (i, b) in pid.iter().take(32).enumerate() { out[i] = *b; }
+    out
+}
 
-    #[arg(
-        long,
-        value_name = "MICROLAMPORTS",
-        help = "Price to pay for compute units. If dynamic fees are enabled, this value will be used as the cap.",
-        default_value = "100000",
-        global = true
-    )]
-    priority_fee: Option<u64>,
+impl Cli {
+    fn seed_b58(&self) -> Option<String> {
+        match &self.cmd {
+            Command::Mine { seed_b58, .. } => seed_b58.clone(),
+            Command::Submit { seed_b58, .. } => seed_b58.clone(),
+        }
+    }
+}
 
-    #[arg(
-        long,
-        value_name = "DYNAMIC_FEE_URL",
-        help = "RPC URL to use for dynamic fee estimation.",
-        global = true
-    )]
-    dynamic_fee_url: Option<String>,
+fn build_client(rpc: &str) -> RpcClient {
+    RpcClient::new_with_commitment(rpc.to_string(), CommitmentConfig::confirmed())
+}
 
-    #[arg(long, help = "Enable dynamic priority fees", global = true)]
-    dynamic_fee: bool,
+fn submit_tx(
+    client: &RpcClient,
+    kp: &Keypair,
+    program_id: Pubkey,
+    miner_pubkey: Pubkey,
+    nonce: u64,
+) -> Result<Signature> {
+    let (miner_pda, _bump) = Pubkey::find_program_address(&[b"miner", miner_pubkey.as_ref()], &program_id);
+    let (config_pda, _cb) = Pubkey::find_program_address(&[b"config"], &program_id);
+    let ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(miner_pda, false),
+            AccountMeta::new_readonly(config_pda, false),
+            AccountMeta::new(miner_pubkey, true),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+        data: {
+            // Anchor discriminator for "submit_proof" + nonce (LE)
+            let disc = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(b"global:submit_proof");
+                let d = h.finalize();
+                let mut a = vec![0u8; 8];
+                a.copy_from_slice(&d[..8]);
+                a
+            };
+            let mut data = disc;
+            data.extend_from_slice(&nonce.to_le_bytes());
+            data
+        },
+    };
 
-    #[arg(
-        long,
-        value_name = "JITO",
-        help = "Add jito tip to the miner. Defaults to false.",
-        global = true
-    )]
-    jito: bool,
+    let bh = client.get_latest_blockhash()?;
+    let msg = Message::new(&[ix], Some(&kp.pubkey()));
+    let mut tx = Transaction::new_unsigned(msg);
+    tx.sign(&[kp], bh);
+    let sig = client.send_and_confirm_transaction(&tx)?;
+    Ok(sig)
+}
 
-    #[command(subcommand)]
-    command: Commands,
+fn mine_with_key(
+    client: &RpcClient,
+    program_id: Pubkey,
+    keypair: &Keypair,
+    difficulty: u32,
+    seed: [u8;32],
+    metrics: bool,
+) -> Result<()> {
+    let miner_pk = keypair.pubkey();
+    let mut rng = rand::thread_rng();
+    let counter = AtomicU64::new(0);
+    let start = std::time::Instant::now();
+    let pb = if metrics {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(ProgressStyle::with_template("{spinner} hashes: {pos}  rate: {per_sec}/s  elapsed: {elapsed}").unwrap());
+        pb.enable_steady_tick(Duration::from_millis(120));
+        Some(pb)
+    } else { None };
+
+    loop {
+        let batch: Vec<u64> = (0..10000).map(|_| rng.gen()).collect();
+        let found = batch.par_iter().find_map_any(|nonce| {
+            let pk32 = miner_pk.to_bytes();
+            let h = pow_hash(&seed, &pk32, *nonce);
+            let lz = leading_zero_bits(&h);
+            if lz >= difficulty {
+                Some(*nonce)
+            } else {
+                counter.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        });
+        if let Some(nonce) = found {
+            if let Some(pb) = &pb {
+                let c = counter.load(Ordering::Relaxed);
+                pb.set_position(c);
+            }
+            match submit_tx(client, keypair, program_id, miner_pk, nonce) {
+                Ok(sig) => {
+                    println!("\n✅ proof accepted: nonce={} sig={}", nonce, sig);
+                },
+                Err(e) => {
+                    eprintln!("\n❌ submit failed: {e}");
+                }
+            }
+        } else if let Some(pb) = &pb {
+            let c = counter.load(Ordering::Relaxed);
+            let secs = start.elapsed().as_secs_f64();
+            pb.set_position(c);
+            if secs > 0.0 {
+                pb.set_message(format!("~{:.2} MH", c as f64 / 1_000_000.0));
+            }
+        }
+    }
 }
 
 #[tokio::main]
-async fn main() {
-    let args = Args::parse();
-
-    // Load the config file from custom path, the default path, or use default config values
-    let cli_config = if let Some(config_file) = &args.config_file {
-        solana_cli_config::Config::load(config_file).unwrap_or_else(|_| {
-            eprintln!("error: Could not find config file `{}`", config_file);
-            std::process::exit(1);
-        })
-    } else if let Some(config_file) = &*solana_cli_config::CONFIG_FILE {
-        solana_cli_config::Config::load(config_file).unwrap_or_default()
-    } else {
-        solana_cli_config::Config::default()
-    };
-
-    // Initialize miner.
-    let cluster = args.rpc.unwrap_or(cli_config.json_rpc_url);
-    let default_keypair = args.keypair.unwrap_or(cli_config.keypair_path.clone());
-    let fee_payer_filepath = args.fee_payer.unwrap_or(default_keypair.clone());
-    let rpc_client = RpcClient::new_with_commitment(cluster, CommitmentConfig::confirmed());
-    let jito_client =
-        RpcClient::new("https://mainnet.block-engine.jito.wtf/api/v1/transactions".to_string());
-
-    let tip = Arc::new(RwLock::new(0_u64));
-    let tip_clone = Arc::clone(&tip);
-    let solo_mining_data = Arc::new(RwLock::new(Vec::new()));
-    let pool_mining_data = Arc::new(RwLock::new(Vec::new()));
-
-    if args.jito {
-        let url = "ws://bundles-api-rest.jito.wtf/api/v1/bundles/tip_stream";
-        let (ws_stream, _) = connect_async(url).await.unwrap();
-        let (_, mut read) = ws_stream.split();
-
-        tokio::spawn(async move {
-            while let Some(message) = read.next().await {
-                if let Ok(Message::Text(text)) = message {
-                    if let Ok(tips) = serde_json::from_str::<Vec<Tip>>(&text) {
-                        for item in tips {
-                            let mut tip = tip_clone.write().unwrap();
-                            *tip = (item.landed_tips_50th_percentile * (10_f64).powf(9.0)) as u64;
-                        }
-                    }
-                }
-            }
-        });
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let client = build_client(&cli.rpc);
+    let program_id = program_pubkey(&cli)?;
+    let mut keys = read_keypairs(&cli)?;
+    if cli.threads > 0 {
+        std::env::set_var("RAYON_NUM_THREADS", cli.threads.to_string());
     }
 
-    let miner = Arc::new(Miner::new(
-        Arc::new(rpc_client),
-        args.priority_fee,
-        Some(default_keypair),
-        args.dynamic_fee_url,
-        args.dynamic_fee,
-        Some(fee_payer_filepath),
-        Arc::new(jito_client),
-        tip,
-        solo_mining_data,
-        pool_mining_data,
-    ));
-
-    // Execute user command.
-    match args.command {
-        Commands::Account(args) => {
-            miner.account(args).await;
-        }
-        Commands::Benchmark(args) => {
-            miner.benchmark(args).await;
-        }
-        Commands::Claim(args) => {
-            if let Err(err) = miner.claim(args).await {
-                println!("{:?}", err);
+    match &cli.cmd {
+        Command::Mine { difficulty, .. } => {
+            let seed = seed_from(&cli);
+            if keys.len() == 1 {
+                mine_with_key(&client, program_id, &keys[0], *difficulty, seed, cli.metrics)?;
+            } else {
+                let handles: Vec<_> = keys
+                    .drain(..)
+                    .map(|kp| {
+                        let client = build_client(&cli.rpc);
+                        let pid = program_id;
+                        let sd = seed;
+                        let diff = *difficulty;
+                        tokio::spawn(async move {
+                            let _ = mine_with_key(&client, pid, &kp, diff, sd, true);
+                        })
+                    }).collect();
+                for h in handles { let _ = h.await; }
             }
         }
-        Commands::Pool(args) => {
-            miner.pool(args).await;
-        }
-        Commands::Program(_) => {
-            miner.program().await;
-        }
-        Commands::Mine(args) => {
-            if let Err(err) = miner.mine(args).await {
-                println!("{:?}", err);
+        Command::Submit { nonce, difficulty, .. } => {
+            let seed = seed_from(&cli);
+            let kp = &keys[0];
+            let pk32 = kp.pubkey().to_bytes();
+            let h = pow_hash(&seed, &pk32, *nonce);
+            let lz = leading_zero_bits(&h);
+            if lz < *difficulty {
+                eprintln!("⚠️  This nonce does NOT meet difficulty (has {} leading zero bits, need >= {})", lz, difficulty);
             }
-        }
-        Commands::Stake(args) => {
-            miner.stake(args).await;
-        }
-        Commands::Transfer(args) => {
-            miner.transfer(args).await;
-        }
-        Commands::Transaction(args) => {
-            miner.transaction(args).await.unwrap();
-        }
-        #[cfg(feature = "admin")]
-        Commands::Initialize(_) => {
-            miner.initialize().await;
-        }
-    }
-}
-
-impl Miner {
-    pub fn new(
-        rpc_client: Arc<RpcClient>,
-        priority_fee: Option<u64>,
-        keypair_filepath: Option<String>,
-        dynamic_fee_url: Option<String>,
-        dynamic_fee: bool,
-        fee_payer_filepath: Option<String>,
-        jito_client: Arc<RpcClient>,
-        tip: Arc<std::sync::RwLock<u64>>,
-        solo_mining_data: Arc<std::sync::RwLock<Vec<SoloMiningData>>>,
-        pool_mining_data: Arc<std::sync::RwLock<Vec<PoolMiningData>>>,
-    ) -> Self {
-        Self {
-            rpc_client,
-            keypair_filepath,
-            priority_fee,
-            dynamic_fee_url,
-            dynamic_fee,
-            fee_payer_filepath,
-            jito_client,
-            tip,
-            solo_mining_data,
-            pool_mining_data,
+            let sig = submit_tx(&client, &kp, program_id, kp.pubkey(), *nonce)?;
+            println!("Submitted proof. sig={sig} (lzbits={lz})");
         }
     }
 
-    pub fn signer(&self) -> Keypair {
-        match self.keypair_filepath.clone() {
-            Some(filepath) => read_keypair_file(filepath.clone())
-                .expect(format!("No keypair found at {}", filepath).as_str()),
-            None => panic!("No keypair provided"),
-        }
-    }
-
-    pub fn fee_payer(&self) -> Keypair {
-        match self.fee_payer_filepath.clone() {
-            Some(filepath) => read_keypair_file(filepath.clone())
-                .expect(format!("No fee payer keypair found at {}", filepath).as_str()),
-            None => panic!("No fee payer keypair provided"),
-        }
-    }
+    Ok(())
 }
